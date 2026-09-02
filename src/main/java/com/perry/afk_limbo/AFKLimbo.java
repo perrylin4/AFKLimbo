@@ -156,6 +156,14 @@ public class AFKLimbo {
                         limbo-spawn-z = 0.0
                         limbo-spawn-yaw = 0.0
                         limbo-spawn-pitch = 0.0
+                        
+                        # limbo 视距和模拟距离
+                        limbo-view-distance = 2
+                        limbo-simulate-distance = 5
+                        
+                        # limbo 最低y值与世界高度(必须为16的整数倍,且与LimboAPI设置一致)
+                        limbo-min-y = -64
+                        limbo-height = 384
                         """);
             }
             config = new Toml().read(file.toFile());
@@ -219,8 +227,8 @@ public class AFKLimbo {
         logger.info("creating limbo server...");
         afkLimbo = factory.createLimbo(world)
                 .setName("afk_limbo")
-                .setViewDistance(8)
-                .setSimulationDistance(8)
+                .setViewDistance(getInt("limbo-view-distance", 2))
+                .setSimulationDistance(getInt("limbo-simulate-distance", 5))
                 .setShouldRespawn(true)
                 .registerCommand(new LimboCommandMeta(List.of("hub")))
                 .setShouldRejoin(true)
@@ -246,8 +254,15 @@ public class AFKLimbo {
             WorldFile opened = factory.openWorldFile(BuiltInWorldFileType.WORLDEDIT_SCHEM, file);
             logger.info("World file loaded! Converting to world");
             opened.toWorld(factory, world, offsetX, offsetY, offsetZ);
+        } catch (IOException e) {
+            logger.error("导入世界文件 {} 失败，使用空世界", fileName, e);
+            return false;
+        }
 
+        try {
             // ---- 临时调试：输出所有区块及是否为空 ----
+            final int world_min_y = getInt("limbo-min-y", -64);
+            final int world_max_y = getInt("limbo-height", 384) + world_min_y;
             List<VirtualChunk> chunks = world.getChunks();
             logger.info("世界共有 {} 个区块:", chunks.size());
             final AtomicInteger total = new AtomicInteger(0);
@@ -274,7 +289,7 @@ public class AFKLimbo {
                 }
                 for (int x = 0; x < 16; x++) {
                     for (int z = 0; z < 16; z++) {
-                        for (int y = -2032; y < 2032; y++) {
+                        for (int y = world_min_y; y < world_max_y; y++) {
                             if (!chunk.getBlock(x, y, z).isAir()) {
                                 if (y > y_max.get()) {
                                     y_max.set(y);
@@ -295,11 +310,7 @@ public class AFKLimbo {
                     total.get(), non_empty.get(),
                     x_min.get(), x_max.get(), z_min.get(), z_max.get(), y_min.get(), y_max.get()
             );
-
-        } catch (IOException e) {
-            logger.error("导入世界文件 {} 失败，使用空世界", fileName, e);
-            return false;
-        }
+        } catch (Exception ignored) {}
         return true;
     }
 
@@ -350,7 +361,7 @@ public class AFKLimbo {
             @Override
             public void onSpawn(Limbo server, LimboPlayer player) {
                 player.sendAbilities(
-                        AbilityFlags.ALLOW_FLYING + AbilityFlags.FLYING,
+                        AbilityFlags.INVULNERABLE,
                         0.1f,
                         1f
                 );
@@ -359,7 +370,7 @@ public class AFKLimbo {
                 player.getProxyPlayer().showTitle(Title.title(
                         Component.empty(),
                         getTitleMessage(player),
-                        Title.Times.times(Duration.ZERO, Duration.ofMillis(72000), Duration.ZERO)
+                        Title.Times.times(Duration.ZERO, Duration.ofDays(7), Duration.ZERO)
                 ));
             }
 
