@@ -1,0 +1,10 @@
+{
+  "id": "afk_limbo",
+  "name": "AFK Limbo",
+  "version": "${version}",
+  "main": "com.perry.afk_limbo.AFKLimbo",
+  "dependencies": [
+    {"id": "packetevents"},
+    {"id": "limboapi"}
+  ]
+}
