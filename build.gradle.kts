@@ -17,7 +17,7 @@ repositories {
 
 dependencies {
     compileOnly("com.velocitypowered:velocity-api:3.5.1")
-    compileOnly("net.elytrium.limboapi:api:1.1.27-SNAPSHOT")
+    compileOnly("net.elytrium.limboapi:api:1.1.28-SNAPSHOT")
     compileOnly("com.github.retrooper:packetevents-velocity:2.13.0")
 }
 

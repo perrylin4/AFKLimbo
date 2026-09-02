@@ -86,8 +86,9 @@ public class AfkLimboCommand implements SimpleCommand {
             source.sendMessage(Component.text("找不到在线玩家: " + args[1], NamedTextColor.RED));
             return;
         }
-        plugin.sendToLimbo(target);
-        source.sendMessage(Component.text("已将 " + target.getUsername() + " 送入 AFK limbo", NamedTextColor.GREEN));
+        boolean success = plugin.sendToLimbo(target);
+        if (success) source.sendMessage(Component.text("已将 " + target.getUsername() + " 送入 AFK limbo", NamedTextColor.GREEN));
+        else source.sendMessage(Component.text("Limbo 尚未初始化完成，请稍后再试", NamedTextColor.RED));
     }
 
     private void handleConfig(CommandSource source, String[] args) {

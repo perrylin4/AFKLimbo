@@ -25,10 +25,12 @@ import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.ServerConnection;
 import com.velocitypowered.api.proxy.server.ServerInfo;
+import com.velocitypowered.api.scheduler.ScheduledTask;
 import net.elytrium.limboapi.api.Limbo;
 import net.elytrium.limboapi.api.LimboFactory;
 import net.elytrium.limboapi.api.LimboSessionHandler;
 import net.elytrium.limboapi.api.chunk.Dimension;
+import net.elytrium.limboapi.api.chunk.VirtualChunk;
 import net.elytrium.limboapi.api.chunk.VirtualWorld;
 import net.elytrium.limboapi.api.command.LimboCommandMeta;
 import net.elytrium.limboapi.api.file.BuiltInWorldFileType;
@@ -37,12 +39,16 @@ import net.elytrium.limboapi.api.material.Block;
 import net.elytrium.limboapi.api.player.GameMode;
 import net.elytrium.limboapi.api.player.LimboPlayer;
 import net.elytrium.limboapi.api.protocol.packets.data.AbilityFlags;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.title.Title;
 import org.jetbrains.annotations.NotNull;
+import org.jspecify.annotations.NonNull;
 import org.slf4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -50,6 +56,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Plugin(
         id = "afk_limbo",
@@ -72,7 +79,8 @@ public class AFKLimbo {
     private final Map<UUID, Long> lastActivity = new ConcurrentHashMap<>();
 
     private Toml config;
-    private Limbo afkLimbo;
+    private Limbo afkLimbo = null;
+    private ScheduledTask createLimboTask = null;
     private final Map<UUID, LimboPlayer> limboPlayers = new ConcurrentHashMap<>();
 
     /** 当前挂机超时时间（秒），可由命令修改并写回配置 */
@@ -89,10 +97,10 @@ public class AFKLimbo {
     public void onProxyInitialization(ProxyInitializeEvent event) {
         loadConfig();
         registerPacketListener();
-        startAfkCheckTask();
+        startTasks();
         registerCommands();
         logger.info("AFK Limbo initialized!");
-        server.getScheduler().buildTask(this, this::createAfkLimbo)
+        createLimboTask = server.getScheduler().buildTask(this, this::createAfkLimbo)
                 .delay(10, TimeUnit.SECONDS).schedule();
     }
 
@@ -100,6 +108,11 @@ public class AFKLimbo {
     public void onProxyShutdown(ProxyShutdownEvent event) {
         lastActivity.clear();
         if (afkLimbo != null) afkLimbo.dispose();
+        if (createLimboTask != null) {
+            try {
+                createLimboTask.cancel();
+            } catch (Exception ignored) {}
+        }
         logger.info("AFK Limbo has been shut down!");
     }
 
@@ -131,6 +144,12 @@ public class AFKLimbo {
                         # 支持 .schem / .schematic / .nbt；留空则使用空世界
                         limbo-world-file = ""
 
+                        # 世界文件导入偏移（把建筑平移到出生点附近，单位：格）
+                        # 如果 schematic 里的建筑不在原点附近，用负偏移把它挪回来
+                        limbo-world-offset-x = 0
+                        limbo-world-offset-y = 0
+                        limbo-world-offset-z = 0
+
                         # limbo 出生点坐标与朝向
                         limbo-spawn-x = 0.0
                         limbo-spawn-y = 64.0
@@ -154,7 +173,7 @@ public class AFKLimbo {
                 .map(ServerConnection::getServerInfo)
                 .map(ServerInfo::getName)
                 .map(this::isInWhitelist)
-                .orElse(false);
+                .orElse(false) && afkTimeoutSeconds > 0;
     }
 
     private boolean isInWhitelist(String serverName) {
@@ -168,9 +187,16 @@ public class AFKLimbo {
         return value != null ? value : defaultValue;
     }
 
+    /** 读取 int 配置，缺失或类型错误时返回默认值 */
+    private int getInt(String key, int defaultValue) {
+        Long value = config.getLong(key, (long) defaultValue);
+        return value != null ? value.intValue() : defaultValue;
+    }
+
     // ---------- Limbo ----------
 
     private void createAfkLimbo() {
+        long startTime = System.currentTimeMillis();
         LimboFactory factory = (LimboFactory) server.getPluginManager()
                 .getPlugin("limboapi")
                 .flatMap(PluginContainer::getInstance)
@@ -186,37 +212,90 @@ public class AFKLimbo {
 
         String worldFile = config.getString("limbo-world-file", "");
         boolean importedWorld = worldFile != null && !worldFile.isBlank();
+        logger.info("generating limbo world...");
         if (importedWorld) importedWorld = loadWorldFile(factory, world, worldFile);
         if (!importedWorld) generatedFallbackLimbo(world, factory);
 
-        afkLimbo = factory.createLimbo(world);
-        afkLimbo.setName("afk_limbo");
-        afkLimbo.setViewDistance(3);
-        afkLimbo.setSimulationDistance(2);
-        afkLimbo.setShouldRespawn(true);
-        afkLimbo.registerCommand(new LimboCommandMeta(List.of("hub")));
-        afkLimbo.setShouldRejoin(true);
-        afkLimbo.setGameMode(GameMode.ADVENTURE);
+        logger.info("creating limbo server...");
+        afkLimbo = factory.createLimbo(world)
+                .setName("afk_limbo")
+                .setViewDistance(8)
+                .setSimulationDistance(8)
+                .setShouldRespawn(true)
+                .registerCommand(new LimboCommandMeta(List.of("hub")))
+                .setShouldRejoin(true)
+                .setGameMode(GameMode.ADVENTURE)
+                .build();
+        logger.info("limbo world generated! duration: {}ms", System.currentTimeMillis() - startTime);
     }
 
     /** 把插件数据目录 worlds/ 下的世界文件导入到 limbo 的虚拟世界 */
     private boolean loadWorldFile(LimboFactory factory, VirtualWorld world, String fileName) {
-        BuiltInWorldFileType type = worldFileType(fileName);
-        if (type == null) {
-            logger.warn("不支持的世界文件类型: {}（支持 .schem / .schematic / .nbt），使用空世界", fileName);
-            return false;
-        }
-
         Path file = dataDirectory.resolve("worlds").resolve(fileName);
         if (!Files.exists(file)) {
             logger.warn("世界文件不存在: {}，使用空世界", file);
             return false;
         }
 
+        int offsetX = getInt("limbo-world-offset-x", 0);
+        int offsetY = getInt("limbo-world-offset-y", 0);
+        int offsetZ = getInt("limbo-world-offset-z", 0);
+
         try {
-            WorldFile opened = factory.openWorldFile(type, file);
-            opened.toWorld(factory, world, 0, 0, 0);
-            logger.info("已导入世界文件 {} 到 AFK limbo", fileName);
+            logger.info("Loading world file...");
+            WorldFile opened = factory.openWorldFile(BuiltInWorldFileType.WORLDEDIT_SCHEM, file);
+            logger.info("World file loaded! Converting to world");
+            opened.toWorld(factory, world, offsetX, offsetY, offsetZ);
+
+            // ---- 临时调试：输出所有区块及是否为空 ----
+            List<VirtualChunk> chunks = world.getChunks();
+            logger.info("世界共有 {} 个区块:", chunks.size());
+            final AtomicInteger total = new AtomicInteger(0);
+            final AtomicInteger non_empty = new AtomicInteger(0);
+            final AtomicInteger x_min = new AtomicInteger(Integer.MAX_VALUE);
+            final AtomicInteger x_max = new AtomicInteger(Integer.MIN_VALUE);
+            final AtomicInteger y_min = new AtomicInteger(Integer.MAX_VALUE);
+            final AtomicInteger y_max = new AtomicInteger(Integer.MIN_VALUE);
+            final AtomicInteger z_min = new AtomicInteger(Integer.MAX_VALUE);
+            final AtomicInteger z_max = new AtomicInteger(Integer.MIN_VALUE);
+            chunks.parallelStream().forEach(chunk -> {
+                int perChunk = 0;
+                if (chunk.getPosX() < x_min.get()) {
+                    x_min.set(chunk.getPosX());
+                }
+                if (chunk.getPosX() > x_max.get()) {
+                    x_max.set(chunk.getPosX());
+                }
+                if (chunk.getPosZ() < z_min.get()) {
+                    z_min.set(chunk.getPosZ());
+                }
+                if (chunk.getPosZ() > z_max.get()) {
+                    z_max.set(chunk.getPosZ());
+                }
+                for (int x = 0; x < 16; x++) {
+                    for (int z = 0; z < 16; z++) {
+                        for (int y = -2032; y < 2032; y++) {
+                            if (!chunk.getBlock(x, y, z).isAir()) {
+                                if (y > y_max.get()) {
+                                    y_max.set(y);
+                                }
+                                if (y < y_min.get()) {
+                                    y_min.set(y);
+                                }
+                                perChunk++;
+                            }
+                        }
+                    }
+                }
+                total.addAndGet(perChunk);
+                if (perChunk > 0) non_empty.incrementAndGet();
+            });
+            logger.info(
+                    "合计 {} 个非空气方块, {} 个非空区块, x在区域[{}, {}], z在区域[{}, {}], 世界方块所在y区域[{}. {}]",
+                    total.get(), non_empty.get(),
+                    x_min.get(), x_max.get(), z_min.get(), z_max.get(), y_min.get(), y_max.get()
+            );
+
         } catch (IOException e) {
             logger.error("导入世界文件 {} 失败，使用空世界", fileName, e);
             return false;
@@ -248,21 +327,13 @@ public class AFKLimbo {
         ));
     }
 
-    private BuiltInWorldFileType worldFileType(String fileName) {
-        String lower = fileName.toLowerCase(Locale.ROOT);
-        if (lower.endsWith(".schem")) {
-            return BuiltInWorldFileType.SCHEMATIC;
+    public boolean sendToLimbo(Player player) {
+        // prevent spam
+        lastActivity.put(player.getUniqueId(), System.currentTimeMillis());
+        if (afkLimbo == null) {
+            logger.warn("trying to send player {} to limbo while limbo is not ready!", player.getUsername());
+            return false;
         }
-        if (lower.endsWith(".schematic")) {
-            return BuiltInWorldFileType.WORLDEDIT_SCHEM;
-        }
-        if (lower.endsWith(".nbt")) {
-            return BuiltInWorldFileType.STRUCTURE;
-        }
-        return null;
-    }
-
-    public void sendToLimbo(Player player) {
         afkLimbo.spawnPlayer(player, new LimboSessionHandler() {
             @Override
             public void onChat(String message) {
@@ -272,24 +343,46 @@ public class AFKLimbo {
                         logger.warn("Unable to find player in limbo: {}!", player.getUsername());
                         return;
                     }
+                    player.clearTitle();
                     limboPlayer.disconnect();
                 }
             }
             @Override
             public void onSpawn(Limbo server, LimboPlayer player) {
                 player.sendAbilities(
-                        AbilityFlags.ALLOW_FLYING + AbilityFlags.FLYING + AbilityFlags.INVULNERABLE + AbilityFlags.CREATIVE_MODE,
+                        AbilityFlags.ALLOW_FLYING + AbilityFlags.FLYING,
                         0.1f,
                         1f
                 );
                 limboPlayers.put(player.getProxyPlayer().getUniqueId(), player);
+                player.getProxyPlayer().sendPlayerListHeader(getTabListMessage(player));
+                player.getProxyPlayer().showTitle(Title.title(
+                        Component.empty(),
+                        getTitleMessage(player),
+                        Title.Times.times(Duration.ZERO, Duration.ofMillis(72000), Duration.ZERO)
+                ));
             }
+
+            private @NonNull Component getTabListMessage(LimboPlayer player) {
+                boolean chinese = player.getProxyPlayer().getEffectiveLocale() == Locale.CHINA;
+                Component message;
+                if (chinese) {
+                    message = Component.text("这是你的神秘梦境")
+                            .appendNewline().append(Component.text("输入/hub醒过来"));
+                } else {
+                    message = Component.text("You have fallen asleep")
+                            .appendNewline().append(Component.text("type '/hub' in chat to wake up"));
+                }
+                return message;
+            }
+
             @Override
             public void onDisconnect() {
                 limboPlayers.remove(player.getUniqueId());
             }
         });
         logger.info("{} 已送入 AFK limbo", player.getUsername());
+        return true;
     }
 
     public ProxyServer getServer() {
@@ -313,6 +406,9 @@ public class AFKLimbo {
             List<String> servers = config.getList("enabled-servers");
             values.put("enabled-servers", servers != null ? servers : List.of());
             values.put("limbo-world-file", config.getString("limbo-world-file", ""));
+            values.put("limbo-world-offset-x", getInt("limbo-world-offset-x", 0));
+            values.put("limbo-world-offset-y", getInt("limbo-world-offset-y", 0));
+            values.put("limbo-world-offset-z", getInt("limbo-world-offset-z", 0));
             values.put("limbo-spawn-x", config.getDouble("limbo-spawn-x", 0.0));
             values.put("limbo-spawn-y", config.getDouble("limbo-spawn-y", 64.0));
             values.put("limbo-spawn-z", config.getDouble("limbo-spawn-z", 0.0));
@@ -364,7 +460,7 @@ public class AFKLimbo {
 
     // ---------- 定时检查 ----------
 
-    private void startAfkCheckTask() {
+    private void startTasks() {
         server.getScheduler().buildTask(this, () -> {
             long now = System.currentTimeMillis();
             long timeoutMs = afkTimeoutSeconds * 1000L;
@@ -387,5 +483,16 @@ public class AFKLimbo {
         }).repeat(10, TimeUnit.SECONDS).schedule();
     }
 
-    private record BlockPos(int  x, int y, int z){}
+    private @NonNull Component getTitleMessage(LimboPlayer player) {
+        boolean chinese = player.getProxyPlayer().getEffectiveLocale() == Locale.CHINA;
+        Component message;
+        if (chinese) {
+            message = Component.text("输入/hub返回大厅");
+        } else {
+            message = Component.text("type '/hub' to return to lobby");
+        }
+        return message;
+    }
+
+    private record BlockPos(int x, int y, int z){}
 }
