@@ -4,9 +4,17 @@ import com.github.retrooper.packetevents.PacketEvents;
 import com.github.retrooper.packetevents.event.PacketListener;
 import com.github.retrooper.packetevents.event.PacketListenerPriority;
 import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
 import com.github.retrooper.packetevents.protocol.packettype.PacketType;
 import com.github.retrooper.packetevents.protocol.packettype.PacketTypeCommon;
-import com.github.retrooper.packetevents.protocol.player.User;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.sound.SoundCategory;
+import com.github.retrooper.packetevents.protocol.sound.Sounds;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerPosition;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerPositionAndRotation;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerPositionAndLook;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSoundEffect;
 import com.google.inject.Inject;
 import com.moandjiezana.toml.Toml;
 import com.moandjiezana.toml.TomlWriter;
@@ -40,6 +48,7 @@ import net.elytrium.limboapi.api.player.GameMode;
 import net.elytrium.limboapi.api.player.LimboPlayer;
 import net.elytrium.limboapi.api.protocol.packets.data.AbilityFlags;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.minimessage.MiniMessage;
 import net.kyori.adventure.title.Title;
 import org.jetbrains.annotations.NotNull;
 import org.jspecify.annotations.NonNull;
@@ -82,9 +91,13 @@ public class AFKLimbo {
     private Limbo afkLimbo = null;
     private ScheduledTask createLimboTask = null;
     private final Map<UUID, LimboPlayer> limboPlayers = new ConcurrentHashMap<>();
+    private final Map<UUID, Vector3d> lastPositions = new ConcurrentHashMap<>();
 
     /** 当前挂机超时时间（秒），可由命令修改并写回配置 */
     private volatile long afkTimeoutSeconds = 300;
+
+    /** 进入 limbo 前的提醒时间（秒） */
+    private volatile long afkTimeoutWarningSeconds = 60;
 
     @Inject
     public AFKLimbo(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) {
@@ -107,6 +120,7 @@ public class AFKLimbo {
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
         lastActivity.clear();
+        lastPositions.clear();
         if (afkLimbo != null) afkLimbo.dispose();
         if (createLimboTask != null) {
             try {
@@ -136,12 +150,14 @@ public class AFKLimbo {
                 Files.writeString(file, """
                         # AFK 超过多少秒后送入 limbo
                         afk-timeout-seconds = 300
+                        # AFK 即将进入limbo前多少秒提醒玩家
+                        afk-timeout-warning-seconds = 60
 
                         # 白名单：只有这些服务器的玩家才会被送入 limbo
                         enabled-servers = ["lobby"]
 
                         # 送入 limbo 时导入的世界文件（放在 插件数据目录/worlds/ 下）
-                        # 支持 .schem / .schematic / .nbt；留空则使用空世界
+                        # 仅支持 .schem；留空则使用空世界
                         limbo-world-file = ""
 
                         # 世界文件导入偏移（把建筑平移到出生点附近，单位：格）
@@ -162,13 +178,31 @@ public class AFKLimbo {
                         limbo-simulate-distance = 5
                         
                         # limbo 最低y值与世界高度(必须为16的整数倍,且与LimboAPI设置一致)
+                        # 如果你不确定你的schem文件的y的范围，建议先设置成
+                        # min-y = -2032, height = 4064，然后从后台看你建筑的实际范围
                         limbo-min-y = -64
                         limbo-height = 384
+
+                        # 玩家进入 limbo 后 Tab 列表头部文案（MiniMessage 格式，支持 <gold> 等颜色标签）
+                        # 中英文各一条，按玩家客户端语言自动选择；<newline> 表示换行
+                        tablist-header-zh = "这是你的神秘梦境<newline>输入 <gold>/hub</gold> 醒过来"
+                        tablist-header-en = "You have fallen asleep<newline>type <gold>/hub</gold> in chat to wake up"
+
+                        # 挂机倒计时开始时的警告副标题（MiniMessage 格式），后面的 ... 由插件自动动态追加
+                        warning-subtitle-zh = "即将进入挂机状态"
+                        warning-subtitle-en = "You are about to enter AFK mode"
+
+                        # 玩家进入 limbo 后显示的副标题（MiniMessage 格式）
+                        limbo-title-zh = "输入 <gold>/hub</gold> 返回大厅"
+                        limbo-title-en = "type <gold>/hub</gold> to return to lobby"
                         """);
             }
             config = new Toml().read(file.toFile());
             Long timeout = config.getLong("afk-timeout-seconds", 300L);
             afkTimeoutSeconds = timeout != null && timeout > 0 ? timeout : 300L;
+            Long warning = config.getLong("afk-timeout-warning-seconds", 60L);
+            long warningSeconds = warning != null && warning > 0 ? warning : 60L;
+            afkTimeoutWarningSeconds = Math.clamp(afkTimeoutSeconds - 1, 0, warningSeconds);
         } catch (Exception e) {
             logger.error("Failed to load config", e);
             config = new Toml();
@@ -226,13 +260,14 @@ public class AFKLimbo {
 
         logger.info("creating limbo server...");
         afkLimbo = factory.createLimbo(world)
-                .setName("afk_limbo")
+                .setName("imagination")
                 .setViewDistance(getInt("limbo-view-distance", 2))
                 .setSimulationDistance(getInt("limbo-simulate-distance", 5))
                 .setShouldRespawn(true)
                 .registerCommand(new LimboCommandMeta(List.of("hub")))
                 .setShouldRejoin(true)
                 .setGameMode(GameMode.ADVENTURE)
+                .setIsHardCore(false)
                 .build();
         logger.info("limbo world generated! duration: {}ms", System.currentTimeMillis() - startTime);
     }
@@ -260,7 +295,7 @@ public class AFKLimbo {
         }
 
         try {
-            // ---- 临时调试：输出所有区块及是否为空 ----
+            // ---- 调试：输出所有区块及是否为空 ----
             final int world_min_y = getInt("limbo-min-y", -64);
             final int world_max_y = getInt("limbo-height", 384) + world_min_y;
             List<VirtualChunk> chunks = world.getChunks();
@@ -338,32 +373,49 @@ public class AFKLimbo {
         ));
     }
 
+    private void refreshPlayerActivityTimer(Player player) {
+        long now = System.currentTimeMillis();
+        UUID playerUuid = player.getUniqueId();
+        if (
+                now - lastActivity.getOrDefault(playerUuid, now) > afkTimeoutSeconds * 1000L - afkTimeoutWarningSeconds * 1000L
+                && isAfkLimboEnabled(player)
+        ) {
+            player.clearTitle();
+        }
+        lastActivity.put(playerUuid, System.currentTimeMillis());
+    }
+
     public boolean sendToLimbo(Player player) {
         // prevent spam
-        lastActivity.put(player.getUniqueId(), System.currentTimeMillis());
+        refreshPlayerActivityTimer(player);
         if (afkLimbo == null) {
             logger.warn("trying to send player {} to limbo while limbo is not ready!", player.getUsername());
+            return false;
+        }
+        if (limboPlayers.containsKey(player.getUniqueId())) {
+            logger.warn("trying to send player {} to limbo while he is already in limbo!", player.getUsername());
             return false;
         }
         afkLimbo.spawnPlayer(player, new LimboSessionHandler() {
             @Override
             public void onChat(String message) {
                 LimboPlayer limboPlayer = limboPlayers.get(player.getUniqueId());
-                if (message.startsWith("/hub")) {
+                if (message.startsWith("/hub ") || message.equalsIgnoreCase("/hub")) {
                     if (limboPlayer == null) {
                         logger.warn("Unable to find player in limbo: {}!", player.getUsername());
                         return;
                     }
                     player.clearTitle();
+                    limboPlayers.remove(player.getUniqueId());
                     limboPlayer.disconnect();
                 }
             }
             @Override
             public void onSpawn(Limbo server, LimboPlayer player) {
                 player.sendAbilities(
-                        AbilityFlags.INVULNERABLE,
-                        0.1f,
-                        1f
+                        AbilityFlags.INVULNERABLE | AbilityFlags.ALLOW_FLYING,
+                        0.05f,
+                        0.1f
                 );
                 limboPlayers.put(player.getProxyPlayer().getUniqueId(), player);
                 player.getProxyPlayer().sendPlayerListHeader(getTabListMessage(player));
@@ -376,15 +428,10 @@ public class AFKLimbo {
 
             private @NonNull Component getTabListMessage(LimboPlayer player) {
                 boolean chinese = player.getProxyPlayer().getEffectiveLocale() == Locale.CHINA;
-                Component message;
-                if (chinese) {
-                    message = Component.text("这是你的神秘梦境")
-                            .appendNewline().append(Component.text("输入/hub醒过来"));
-                } else {
-                    message = Component.text("You have fallen asleep")
-                            .appendNewline().append(Component.text("type '/hub' in chat to wake up"));
-                }
-                return message;
+                String template = chinese
+                        ? config.getString("tablist-header-zh", "这是你的神秘梦境<newline>输入 <gold>/hub</gold> 醒过来")
+                        : config.getString("tablist-header-en", "You have fallen asleep<newline>type '<gold>/hub</gold>' in chat to wake up");
+                return MiniMessage.miniMessage().deserialize(template);
             }
 
             @Override
@@ -404,9 +451,23 @@ public class AFKLimbo {
         return afkTimeoutSeconds;
     }
 
+    public long getAfkTimeoutWarningSeconds() {
+        return afkTimeoutWarningSeconds;
+    }
+
     /** 修改挂机超时时间并写回 config.toml（同时保留其他所有配置项） */
     public void setAfkTimeoutSeconds(long seconds) {
         afkTimeoutSeconds = seconds;
+        // 保证 warning 不超过 timeout-1
+        if (afkTimeoutWarningSeconds > afkTimeoutSeconds - 1) {
+            afkTimeoutWarningSeconds = Math.max(afkTimeoutSeconds - 1, 0);
+        }
+        saveConfig();
+    }
+
+    /** 修改进入 limbo 前的提醒时间（秒）并写回 config.toml */
+    public void setAfkTimeoutWarningSeconds(long seconds) {
+        afkTimeoutWarningSeconds = Math.clamp(seconds, 0, Math.max(afkTimeoutSeconds - 1, 0));
         saveConfig();
     }
 
@@ -414,6 +475,7 @@ public class AFKLimbo {
         try {
             Map<String, Object> values = new LinkedHashMap<>();
             values.put("afk-timeout-seconds", afkTimeoutSeconds);
+            values.put("afk-timeout-warning-seconds", afkTimeoutWarningSeconds);
             List<String> servers = config.getList("enabled-servers");
             values.put("enabled-servers", servers != null ? servers : List.of());
             values.put("limbo-world-file", config.getString("limbo-world-file", ""));
@@ -425,6 +487,16 @@ public class AFKLimbo {
             values.put("limbo-spawn-z", config.getDouble("limbo-spawn-z", 0.0));
             values.put("limbo-spawn-yaw", config.getDouble("limbo-spawn-yaw", 0.0));
             values.put("limbo-spawn-pitch", config.getDouble("limbo-spawn-pitch", 0.0));
+            values.put("limbo-view-distance", getInt("limbo-view-distance", 2));
+            values.put("limbo-simulate-distance", getInt("limbo-simulate-distance", 5));
+            values.put("limbo-min-y", getInt("limbo-min-y", -64));
+            values.put("limbo-height", getInt("limbo-height", 384));
+            values.put("tablist-header-zh", config.getString("tablist-header-zh", "这是你的神秘梦境<newline>输入 <gold>/hub</gold> 醒过来"));
+            values.put("tablist-header-en", config.getString("tablist-header-en", "You have fallen asleep<newline>type <gold>/hub</gold> in chat to wake up"));
+            values.put("warning-subtitle-zh", config.getString("warning-subtitle-zh", "即将进入挂机状态"));
+            values.put("warning-subtitle-en", config.getString("warning-subtitle-en", "You are about to enter AFK mode"));
+            values.put("limbo-title-zh", config.getString("limbo-title-zh", "输入 <gold>/hub</gold> 返回大厅"));
+            values.put("limbo-title-en", config.getString("limbo-title-en", "type <gold>/hub</gold> to return to lobby"));
             new TomlWriter().write(values, dataDirectory.resolve("config.toml").toFile());
             logger.info("AFK 超时时间已保存为 {} 秒", afkTimeoutSeconds);
         } catch (IOException e) {
@@ -438,9 +510,25 @@ public class AFKLimbo {
         PacketEvents.getAPI().getEventManager().registerListener(new PacketListener() {
             @Override
             public void onPacketReceive(@NotNull PacketReceiveEvent event) {
+                Player player = event.getPlayer();
+                if (player == null) return;
                 if (shouldResetTimer(event.getPacketType())) {
-                    User user = event.getUser();
-                    lastActivity.put(user.getUUID(), System.currentTimeMillis());
+                    refreshPlayerActivityTimer(player);
+                }
+                if (event.getPacketType() == PacketType.Play.Client.PLAYER_POSITION) {
+                    WrapperPlayClientPlayerPosition wrapper = new WrapperPlayClientPlayerPosition(event);
+                    lastPositions.put(player.getUniqueId(), wrapper.getPosition());
+                } else if (event.getPacketType() == PacketType.Play.Client.PLAYER_POSITION_AND_ROTATION) {
+                    WrapperPlayClientPlayerPositionAndRotation wrapper = new WrapperPlayClientPlayerPositionAndRotation(event);
+                    lastPositions.put(player.getUniqueId(), wrapper.getPosition());
+                }
+            }
+            @Override
+            public void onPacketSend(@NonNull PacketSendEvent event) {
+                if (event.getPacketType() == PacketType.Play.Server.PLAYER_POSITION_AND_LOOK) {
+                    Player player = event.getPlayer();
+                    WrapperPlayServerPlayerPositionAndLook wrapper = new WrapperPlayServerPlayerPositionAndLook(event);
+                    lastPositions.put(player.getUniqueId(), wrapper.getPosition());
                 }
             }
         }, PacketListenerPriority.NORMAL);
@@ -448,12 +536,13 @@ public class AFKLimbo {
 
     @Subscribe
     public void onServerConnected(ServerConnectedEvent event) {
-        lastActivity.put(event.getPlayer().getUniqueId(), System.currentTimeMillis());
+        refreshPlayerActivityTimer(event.getPlayer());
     }
 
     @Subscribe
     public void onDisconnect(DisconnectEvent event) {
         lastActivity.remove(event.getPlayer().getUniqueId());
+        lastPositions.remove(event.getPlayer().getUniqueId());
     }
 
     private boolean shouldResetTimer(PacketTypeCommon type) {
@@ -466,7 +555,11 @@ public class AFKLimbo {
                 || type == PacketType.Play.Client.USE_ITEM
                 || type == PacketType.Play.Client.HELD_ITEM_CHANGE
                 || type == PacketType.Play.Client.PLAYER_INPUT
-                || type == PacketType.Play.Client.ANIMATION;
+                || type == PacketType.Play.Client.ANIMATION
+                || type == PacketType.Play.Client.CLICK_WINDOW
+                || type == PacketType.Play.Client.CLICK_WINDOW_BUTTON
+                || type == PacketType.Play.Client.CLOSE_WINDOW
+                ;
     }
 
     // ---------- 定时检查 ----------
@@ -475,6 +568,7 @@ public class AFKLimbo {
         server.getScheduler().buildTask(this, () -> {
             long now = System.currentTimeMillis();
             long timeoutMs = afkTimeoutSeconds * 1000L;
+            long timeoutWarningMs = afkTimeoutSeconds * 1000L - afkTimeoutWarningSeconds * 1000L;
 
             for (Map.Entry<UUID, Long> entry : lastActivity.entrySet()) {
                 Player player = server.getPlayer(entry.getKey()).orElse(null);
@@ -482,25 +576,60 @@ public class AFKLimbo {
                     lastActivity.remove(entry.getKey());
                     continue;
                 }
+                if (!isAfkLimboEnabled(player)) {
+                    continue;
+                }
+                if (now - entry.getValue() > timeoutWarningMs) {
+                    player.showTitle(Title.title(
+                            Component.empty(),
+                            getWarningSubtitleMessage(player, now - entry.getValue()),
+                            Title.Times.times(Duration.ZERO, Duration.ofSeconds(11), Duration.ZERO)
+                    ));
+                    Vector3d position = lastPositions.get(player.getUniqueId());
+                    Object playerChannel = PacketEvents.getAPI().getPlayerManager().getChannel(player);
+                    if (position != null && playerChannel != null) {
+                        WrapperPlayServerSoundEffect wrapper = new WrapperPlayServerSoundEffect(
+                                Sounds.BLOCK_BELL_RESONATE.getId(ClientVersion.getById(player.getProtocolVersion().getProtocol())),
+                                SoundCategory.UI,
+                                position,
+                                1f,
+                                1.75f,
+                                0
+                        );
+                        PacketEvents.getAPI().getProtocolManager().sendPacket(playerChannel, wrapper);
+                    }
+                }
                 if (now - entry.getValue() < timeoutMs) {
                     continue;
                 }
-                // 超时 → 白名单判断（此刻玩家还在原服，getCurrentServer() 有效）
-                if (isAfkLimboEnabled(player)) {
-                    sendToLimbo(player);
-                    lastActivity.put(entry.getKey(), now); // 防止下一轮重复送入
-                }
+                sendToLimbo(player);
             }
         }).repeat(10, TimeUnit.SECONDS).schedule();
     }
 
     private @NonNull Component getTitleMessage(LimboPlayer player) {
         boolean chinese = player.getProxyPlayer().getEffectiveLocale() == Locale.CHINA;
-        Component message;
-        if (chinese) {
-            message = Component.text("输入/hub返回大厅");
-        } else {
-            message = Component.text("type '/hub' to return to lobby");
+        String template = chinese
+                ? config.getString("limbo-title-zh", "输入 <gold>/hub</gold> 返回大厅")
+                : config.getString("limbo-title-en", "type '<gold>/hub</gold>' to return to lobby");
+        return MiniMessage.miniMessage().deserialize(template);
+    }
+
+    private @NonNull Component getWarningSubtitleMessage(Player player, long elapsedMs) {
+        // elapsedMs = 距上次活动已过去的时间（挂机时长），由调用处传入。
+        // 点随临近超时递增：进入警告区后每约 10 秒加一点，封顶 3（省略号效果）。
+        long warningStartMs = (afkTimeoutSeconds - afkTimeoutWarningSeconds) * 1000L; // 警告区起点(elapsed)
+        long warningElapsedMs = elapsedMs - warningStartMs;                          // 进入警告区后经过多久(>=0)
+        int dots = 1 + (int) (Math.max(0, warningElapsedMs) / 10_000L);
+        dots %= 8;
+
+        boolean chinese = player.getEffectiveLocale() == Locale.CHINA;
+        String template = chinese
+                ? config.getString("warning-subtitle-zh", "即将进入挂机状态")
+                : config.getString("warning-subtitle-en", "You are about to enter AFK mode");
+        Component message = MiniMessage.miniMessage().deserialize(template);
+        for (int i = 0; i < dots; i++) {
+            message = message.append(Component.text("."));
         }
         return message;
     }
